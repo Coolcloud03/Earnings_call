@@ -203,6 +203,43 @@
         font-size: 0.95rem;
       }
 
+      .rag-panel {
+        display: grid;
+        gap: 14px;
+        margin-top: 16px;
+      }
+
+      .rag-input,
+      .rag-textarea {
+        width: 100%;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(2, 6, 23, 0.45);
+        color: var(--text);
+        padding: 12px 14px;
+        font: inherit;
+      }
+
+      .rag-textarea {
+        min-height: 100px;
+        resize: vertical;
+      }
+
+      .rag-result {
+        min-height: 110px;
+        padding: 14px;
+        border-radius: 14px;
+        background: rgba(34, 197, 94, 0.12);
+        border: 1px solid rgba(34, 197, 94, 0.2);
+        color: #dcfce7;
+        white-space: pre-wrap;
+      }
+
+      .small {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+
       @media (max-width: 850px) {
         .body { grid-template-columns: 1fr; }
         .hero { flex-direction: column; align-items: flex-start; }
@@ -239,6 +276,26 @@
               <p id="connectionMessage">WebSocket endpoint: ws://127.0.0.1:8000/ws/stream</p>
             </div>
           </div>
+
+          <div class="rag-panel">
+            <div class="info-box">
+              <h3>Upload documents</h3>
+              <input id="documentInput" type="file" accept=".txt,.pdf" />
+              <div class="controls" style="margin-top: 12px;">
+                <button id="uploadButton" class="secondary">📄 Upload</button>
+              </div>
+              <p id="uploadMessage" class="small">Upload a PDF or text file to index it for RAG.</p>
+            </div>
+
+            <div class="info-box">
+              <h3>Ask the knowledge base</h3>
+              <input id="questionInput" class="rag-input" type="text" placeholder="Ask a question about your uploaded docs" />
+              <div class="controls" style="margin-top: 12px;">
+                <button id="askButton" class="primary">💬 Ask</button>
+              </div>
+              <div id="ragResult" class="rag-result">Your answer will appear here.</div>
+            </div>
+          </div>
         </div>
 
         <div class="card">
@@ -255,6 +312,7 @@
 
     <script>
       const socketUrl = 'ws://127.0.0.1:8000/ws/stream';
+      const apiBase = (window.location.origin && window.location.origin !== 'null') ? window.location.origin : 'http://127.0.0.1:8000';
       const startButton = document.getElementById('startButton');
       const stopButton = document.getElementById('stopButton');
       const connectionIndicator = document.getElementById('connectionIndicator');
@@ -263,6 +321,12 @@
       const connectionMessage = document.getElementById('connectionMessage');
       const liveState = document.getElementById('liveState');
       const transcriptionPanel = document.getElementById('transcriptionPanel');
+      const documentInput = document.getElementById('documentInput');
+      const uploadButton = document.getElementById('uploadButton');
+      const uploadMessage = document.getElementById('uploadMessage');
+      const questionInput = document.getElementById('questionInput');
+      const askButton = document.getElementById('askButton');
+      const ragResult = document.getElementById('ragResult');
 
       let socket = null;
       let audioContext = null;
@@ -436,8 +500,65 @@
         }
       }
 
+      async function uploadDocument() {
+        const file = documentInput.files?.[0];
+        if (!file) {
+          uploadMessage.textContent = 'Choose a file first.';
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+        uploadMessage.textContent = 'Uploading and indexing document...';
+
+        try {
+          const response = await fetch(`${apiBase}/rag/upload`, {
+            method: 'POST',
+            body: formData,
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || 'Upload failed');
+          }
+          uploadMessage.textContent = `Indexed ${data.file_name} with ${data.chunks_added} chunk(s).`;
+        } catch (error) {
+          uploadMessage.textContent = error.message || 'Upload failed.';
+        }
+      }
+
+      async function askDocumentQuestion() {
+        const question = questionInput.value.trim();
+        if (!question) {
+          ragResult.textContent = 'Enter a question first.';
+          return;
+        }
+
+        ragResult.textContent = 'Thinking...';
+        try {
+          const response = await fetch(`${apiBase}/rag/query`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question }),
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || 'Query failed');
+          }
+          ragResult.textContent = data.answer || 'No answer returned.';
+        } catch (error) {
+          ragResult.textContent = error.message || 'Query failed.';
+        }
+      }
+
       startButton.addEventListener('click', startStreaming);
       stopButton.addEventListener('click', stopStreaming);
+      uploadButton.addEventListener('click', uploadDocument);
+      askButton.addEventListener('click', askDocumentQuestion);
+      questionInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          askDocumentQuestion();
+        }
+      });
 
       window.addEventListener('beforeunload', () => {
         stopStreaming();

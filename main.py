@@ -1,6 +1,19 @@
 import asyncio
+import io
+import json
 import os
+import re
+from pathlib import Path
 from typing import Any
+
+import faiss
+import numpy as np
+from dotenv import load_dotenv
+from openai import OpenAI
+from pypdf import PdfReader
+from pinecone import Pinecone
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 
 async def consume_transcript_messages(connection: Any, transcript_queue: "asyncio.Queue[str]") -> None:
@@ -15,9 +28,9 @@ async def consume_transcript_messages(connection: Any, transcript_queue: "asynci
         print(f"[deepgram][transcript-error] {exc}")
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
-from pathlib import Path
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 
 try:
     from deepgram import AsyncDeepgramClient
@@ -25,6 +38,173 @@ except ImportError:  # pragma: no cover - handled gracefully at runtime
     AsyncDeepgramClient = None
 
 app = FastAPI(title="Earnings Call AI Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DOCS_DIR = DATA_DIR / "documents"
+DOCS_DIR.mkdir(exist_ok=True)
+INDEX_PATH = DATA_DIR / "faiss.index"
+METADATA_PATH = DATA_DIR / "metadata.json"
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+CHAT_MODEL = "gpt-4o-mini"
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "").strip()
+PINECONE_ENV = (os.getenv("PINECONE_ENVIRONMENT") or os.getenv("PINECONE_ENV") or "").strip()
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if OPENAI_API_KEY:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    openai_client = None
+
+pinecone_client = None
+if PINECONE_API_KEY and PINECONE_ENV and PINECONE_INDEX:
+    pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+
+
+def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def _extract_pdf_text(file_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(page for page in pages if page).strip()
+
+
+def _get_embedding(text: str) -> list[float]:
+    if openai_client is None:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    response = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=text)
+    return response.data[0].embedding
+
+
+def _load_index_state() -> tuple[faiss.IndexFlatL2 | None, list[dict[str, Any]]]:
+    if not INDEX_PATH.exists() or not METADATA_PATH.exists():
+        return None, []
+    index = faiss.read_index(str(INDEX_PATH))
+    with METADATA_PATH.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    return index, metadata
+
+
+def _save_index_state(index: faiss.IndexFlatL2, metadata: list[dict[str, Any]]) -> None:
+    faiss.write_index(index, str(INDEX_PATH))
+    with METADATA_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+
+def _upsert_to_pinecone(file_name: str, chunks: list[str], embeddings: list[list[float]]) -> None:
+    if not pinecone_client or not PINECONE_INDEX:
+        return
+    try:
+        index = pinecone_client.Index(PINECONE_INDEX)
+        vectors = []
+        for chunk, embedding in zip(chunks, embeddings, strict=False):
+            vectors.append((f"{file_name}:{len(vectors)}", embedding, {"source": file_name, "text": chunk}))
+        if vectors:
+            index.upsert(vectors=vectors)
+    except Exception as exc:  # pragma: no cover - runtime logging path
+        print(f"[pinecone][upsert-error] {exc}")
+
+
+def ingest_document(file_name: str, file_bytes: bytes) -> dict[str, Any]:
+    if file_name.lower().endswith(".pdf"):
+        text = _extract_pdf_text(file_bytes)
+    else:
+        text = file_bytes.decode("utf-8", errors="ignore")
+
+    chunks = _chunk_text(text)
+    if not chunks:
+        raise ValueError("No text could be extracted from the uploaded document")
+
+    index, metadata = _load_index_state()
+    if index is None:
+        dimension = 1536
+        index = faiss.IndexFlatL2(dimension)
+    embeddings = []
+    for chunk in chunks:
+        embedding = _get_embedding(chunk)
+        embeddings.append(embedding)
+
+    vectors = np.array(embeddings, dtype="float32")
+    index.add(vectors)
+
+    for chunk in chunks:
+        metadata.append({"source": file_name, "text": chunk})
+
+    _save_index_state(index, metadata)
+    _upsert_to_pinecone(file_name, chunks, embeddings)
+    return {"file_name": file_name, "chunks_added": len(chunks)}
+
+
+@app.post("/rag/upload")
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    try:
+        contents = await file.read()
+        result = ingest_document(file.filename or "upload.txt", contents)
+        return JSONResponse(status_code=200, content=result)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.post("/rag/query")
+async def query_documents(payload: dict[str, Any]) -> JSONResponse:
+    try:
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            raise ValueError("A question is required")
+        if openai_client is None:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+
+        if pinecone_client and PINECONE_INDEX:
+            query_embedding = _get_embedding(question)
+            index = pinecone_client.Index(PINECONE_INDEX)
+            response = index.query(vector=query_embedding, top_k=4, include_metadata=True)
+            context_chunks = [match["metadata"]["text"] for match in response.get("matches", []) if match.get("metadata")]
+        else:
+            index, metadata = _load_index_state()
+            if index is None or not metadata:
+                raise ValueError("No documents have been indexed yet")
+            query_embedding = _get_embedding(question)
+            query_vector = np.array([query_embedding], dtype="float32")
+            _, indices = index.search(query_vector, min(4, len(metadata)))
+            context_chunks = [metadata[int(i)]["text"] for i in indices[0] if int(i) < len(metadata)]
+
+        context = "\n\n".join(context_chunks)
+
+        response = openai_client.responses.create(
+            model=CHAT_MODEL,
+            input=[
+                {"role": "system", "content": "You answer questions using the provided document context. If the information is not present, say you do not know."},
+                {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
+            ],
+        )
+        answer = response.output_text
+        return JSONResponse(status_code=200, content={"answer": answer, "context": context_chunks})
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @app.get("/", include_in_schema=False)
