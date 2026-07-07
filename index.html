@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Earnings Call AI Dashboard</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #07111f;
+        --panel: rgba(15, 23, 42, 0.9);
+        --panel-2: #111c31;
+        --text: #f8fafc;
+        --muted: #94a3b8;
+        --accent: #22c55e;
+        --accent-2: #38bdf8;
+        --danger: #ef4444;
+        --border: rgba(148, 163, 184, 0.18);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+        background: radial-gradient(circle at top, #13253f 0%, var(--bg) 58%, #020617 100%);
+        color: var(--text);
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      .app {
+        width: min(1100px, 100%);
+        background: var(--panel);
+        backdrop-filter: blur(18px);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        box-shadow: 0 18px 45px rgba(2, 6, 23, 0.45);
+        overflow: hidden;
+      }
+
+      .hero {
+        padding: 28px 32px 22px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+      }
+
+      .hero h1 {
+        margin: 0 0 8px;
+        font-size: clamp(1.4rem, 2vw, 1.9rem);
+      }
+
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.96rem;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--danger);
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+        transition: all 0.25s ease;
+      }
+
+      .indicator.live {
+        background: var(--accent);
+        box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+        animation: pulse 1.2s infinite;
+      }
+
+      @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); }
+        70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+      }
+
+      .body {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 20px;
+        padding: 24px 32px 32px;
+      }
+
+      .card {
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 20px;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      button {
+        border: none;
+        border-radius: 999px;
+        padding: 12px 16px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 0.2s ease, opacity 0.2s ease;
+      }
+
+      button:hover { transform: translateY(-1px); }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .primary {
+        background: linear-gradient(135deg, var(--accent-2), #6366f1);
+        color: white;
+      }
+
+      .secondary {
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text);
+      }
+
+      .info-panel {
+        display: grid;
+        gap: 16px;
+      }
+
+      .info-box {
+        padding: 14px 16px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255,255,255,0.06);
+      }
+
+      .info-box h3 {
+        margin: 0 0 6px;
+        font-size: 0.95rem;
+      }
+
+      .info-box p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .transcription-panel {
+        height: 360px;
+        overflow-y: auto;
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(2, 6, 23, 0.48);
+        border: 1px solid rgba(255,255,255,0.06);
+        line-height: 1.6;
+      }
+
+      .placeholder {
+        color: var(--muted);
+        font-style: italic;
+      }
+
+      .bubble {
+        margin-bottom: 10px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(56, 189, 248, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.18);
+      }
+
+      .bubble strong {
+        display: inline-block;
+        margin-bottom: 4px;
+        color: #bae6fd;
+      }
+
+      .status-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      @media (max-width: 850px) {
+        .body { grid-template-columns: 1fr; }
+        .hero { flex-direction: column; align-items: flex-start; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="hero">
+        <div>
+          <h1>Earnings Call AI Dashboard</h1>
+          <p>Capture live audio, stream it to your FastAPI backend, and view transcription in real time.</p>
+        </div>
+        <div class="status-pill" id="connectionStatus">
+          <span class="indicator" id="connectionIndicator"></span>
+          <span id="connectionText">Offline</span>
+        </div>
+      </section>
+
+      <section class="body">
+        <div class="card">
+          <div class="controls">
+            <button id="startButton" class="primary">🎙️ Start Session</button>
+            <button id="stopButton" class="secondary" disabled>⏹ Stop Session</button>
+          </div>
+
+          <div class="info-panel">
+            <div class="info-box">
+              <h3>Session state</h3>
+              <p id="sessionMessage">Press Start Session to request microphone access and begin streaming.</p>
+            </div>
+            <div class="info-box">
+              <h3>Connection details</h3>
+              <p id="connectionMessage">WebSocket endpoint: ws://127.0.0.1:8000/ws/stream</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="status-row">
+            <strong>Live transcript</strong>
+            <span id="liveState">Idle</span>
+          </div>
+          <div id="transcriptionPanel" class="transcription-panel">
+            <div class="placeholder">Transcribed text will appear here in real-time...</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const socketUrl = 'ws://127.0.0.1:8000/ws/stream';
+      const startButton = document.getElementById('startButton');
+      const stopButton = document.getElementById('stopButton');
+      const connectionIndicator = document.getElementById('connectionIndicator');
+      const connectionText = document.getElementById('connectionText');
+      const sessionMessage = document.getElementById('sessionMessage');
+      const connectionMessage = document.getElementById('connectionMessage');
+      const liveState = document.getElementById('liveState');
+      const transcriptionPanel = document.getElementById('transcriptionPanel');
+
+      let socket = null;
+      let audioContext = null;
+      let processor = null;
+      let inputNode = null;
+      let stream = null;
+      let isStreaming = false;
+      let reconnectTimer = null;
+      let audioChunkCount = 0;
+
+      function setConnectionState(state, message) {
+        connectionText.textContent = state;
+        connectionMessage.textContent = message;
+        connectionIndicator.classList.toggle('live', state === 'Live Listening' || state === 'Connected');
+      }
+
+      function appendTranscript(text) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'bubble';
+        wrapper.innerHTML = `<strong>Transcript</strong><div>${text}</div>`;
+        transcriptionPanel.appendChild(wrapper);
+        transcriptionPanel.scrollTop = transcriptionPanel.scrollHeight;
+      }
+
+      function resetTranscriptPanel() {
+        transcriptionPanel.innerHTML = '<div class="placeholder">Transcribed text will appear here in real-time...</div>';
+      }
+
+      function convertTo16BitPcm(inputData, sampleRate) {
+        const ratio = sampleRate / 16000;
+        const targetLength = Math.max(1, Math.floor(inputData.length / ratio));
+        const output = new Int16Array(targetLength);
+
+        for (let index = 0; index < targetLength; index += 1) {
+          const sourceIndex = Math.min(inputData.length - 1, Math.floor(index * ratio));
+          const sample = inputData[sourceIndex];
+          const clamped = Math.max(-1, Math.min(1, sample));
+          output[index] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        }
+
+        return output;
+      }
+
+      function stopAudioCapture() {
+        if (processor) {
+          processor.disconnect();
+          processor.onaudioprocess = null;
+          processor = null;
+        }
+        if (inputNode) {
+          inputNode.disconnect();
+          inputNode = null;
+        }
+        if (audioContext && audioContext.state !== 'closed') {
+          audioContext.close().catch(() => {});
+        }
+        audioContext = null;
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+          stream = null;
+        }
+      }
+
+      function connectWebSocket() {
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+          return Promise.resolve(socket);
+        }
+
+        setConnectionState('Connecting', 'Opening WebSocket connection...');
+        sessionMessage.textContent = 'Connecting to the backend...';
+
+        return new Promise((resolve, reject) => {
+          socket = new WebSocket(socketUrl);
+
+          socket.addEventListener('open', () => {
+            clearTimeout(reconnectTimer);
+            setConnectionState('Connected', 'WebSocket connected. Waiting for audio capture to begin.');
+            sessionMessage.textContent = 'Connected. Recording is ready.';
+            liveState.textContent = 'Ready';
+            resolve(socket);
+          });
+
+          socket.addEventListener('message', (event) => {
+            const text = typeof event.data === 'string' ? event.data : '[binary message]';
+            if (text) {
+              appendTranscript(text);
+            }
+          });
+
+          socket.addEventListener('close', () => {
+            if (!isStreaming) {
+              setConnectionState('Offline', 'WebSocket disconnected.');
+              sessionMessage.textContent = 'Connection closed. Retrying automatically...';
+              liveState.textContent = 'Idle';
+              if (!reconnectTimer) {
+                reconnectTimer = setTimeout(() => {
+                  reconnectTimer = null;
+                  connectWebSocket().catch(() => {});
+                }, 1200);
+              }
+            } else {
+              setConnectionState('Offline', 'WebSocket disconnected during streaming.');
+              sessionMessage.textContent = 'Connection lost during streaming.';
+              liveState.textContent = 'Idle';
+            }
+            stopStreaming();
+          });
+
+          socket.addEventListener('error', () => {
+            setConnectionState('Error', 'WebSocket connection error.');
+            sessionMessage.textContent = 'Unable to connect to the websocket endpoint. Retrying...';
+            liveState.textContent = 'Error';
+            reject(new Error('Unable to connect to the websocket endpoint.'));
+          });
+        });
+      }
+
+      async function startStreaming() {
+        if (isStreaming) return;
+
+        try {
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('Microphone access is not supported in this browser.');
+          }
+
+          await connectWebSocket();
+          const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream = permissionStream;
+
+          audioContext = new AudioContext();
+          await audioContext.resume();
+
+          inputNode = audioContext.createMediaStreamSource(stream);
+          processor = audioContext.createScriptProcessor(4096, 1, 1);
+          processor.onaudioprocess = (event) => {
+            const inputData = event.inputBuffer.getChannelData(0);
+            const pcmData = convertTo16BitPcm(inputData, audioContext.sampleRate);
+            if (socket?.readyState === WebSocket.OPEN) {
+              audioChunkCount += 1;
+              socket.send(new Uint8Array(pcmData.buffer));
+              if (audioChunkCount % 20 === 0) {
+                console.log(`[audio] sent ${audioChunkCount} chunks (${pcmData.length} samples)`);
+              }
+            }
+          };
+
+          inputNode.connect(processor);
+          processor.connect(audioContext.destination);
+
+          isStreaming = true;
+          startButton.disabled = true;
+          stopButton.disabled = false;
+          setConnectionState('Live Listening', 'Connected to websocket. Audio streaming is active.');
+          sessionMessage.textContent = 'Microphone access granted. Streaming audio in real time.';
+          liveState.textContent = 'Listening';
+        } catch (error) {
+          console.error(error);
+          stopAudioCapture();
+          sessionMessage.textContent = error.message || 'Could not start recording.';
+          setConnectionState('Connected', 'WebSocket connected. Microphone capture could not start yet.');
+        }
+      }
+
+      function stopStreaming() {
+        stopAudioCapture();
+        isStreaming = false;
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      }
+
+      startButton.addEventListener('click', startStreaming);
+      stopButton.addEventListener('click', stopStreaming);
+
+      window.addEventListener('beforeunload', () => {
+        stopStreaming();
+      });
+
+      resetTranscriptPanel();
+    </script>
+  </body>
+</html>
