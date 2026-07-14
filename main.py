@@ -54,7 +54,7 @@ INDEX_PATH = DATA_DIR / "faiss.index"
 METADATA_PATH = DATA_DIR / "metadata.json"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
+CHAT_MODEL = "gpt-4o"
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "").strip()
 PINECONE_ENV = (os.getenv("PINECONE_ENVIRONMENT") or os.getenv("PINECONE_ENV") or "").strip()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
@@ -169,40 +169,104 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
+def extract_questions_from_transcript(transcript: str) -> list[str]:
+    cleaned = (transcript or "").strip()
+    if not cleaned:
+        return []
+
+    def normalize_question(raw: str) -> str:
+        question = re.sub(r"\s+", " ", raw or "").strip(" -•,;:")
+        if not question:
+            return ""
+        question = re.sub(r"^(?:also|and|so|well|uh|um|let me see|let's see|i mean|i guess|okay|right)\s*,?\s*", "", question, flags=re.IGNORECASE)
+        question = question.strip(" -•,;:")
+        if not question.endswith("?"):
+            question = f"{question}?"
+        return question.strip()
+
+    if openai_client is None:
+        fallback_questions = []
+        for segment in re.split(r"(?<=[?.!])\s+", cleaned):
+            if "?" not in segment:
+                continue
+            normalized = normalize_question(segment)
+            if normalized and normalized not in fallback_questions:
+                fallback_questions.append(normalized)
+        return fallback_questions
+
+    try:
+        prompt = (
+            "You are an extraction filter. Analyze the full transcript, remove conversational filler, and return a strict JSON array of every distinct question asked by the caller. "
+            "Do not include greetings, small talk, or non-question statements. Return only valid JSON, e.g. [\"What is the revenue trend?\"]."
+        )
+        response = openai_client.responses.create(
+            model=CHAT_MODEL,
+            input=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": cleaned},
+            ],
+        )
+        answer_text = (response.output_text or "").strip()
+        if answer_text.startswith("[") and answer_text.endswith("]"):
+            parsed = json.loads(answer_text)
+            if isinstance(parsed, list):
+                questions = [normalize_question(str(item)) for item in parsed if str(item).strip()]
+                return [question for question in questions if question]
+    except Exception as exc:  # pragma: no cover - runtime logging path
+        print(f"[extract-questions][error] {exc}")
+
+    fallback_questions = []
+    for segment in re.split(r"(?<=[?.!])\s+", cleaned):
+        if "?" not in segment:
+            continue
+        normalized = normalize_question(segment)
+        if normalized and normalized not in fallback_questions:
+            fallback_questions.append(normalized)
+    return fallback_questions
+
+
+def answer_question_with_rag(question: str) -> dict[str, Any]:
+    question = (question or "").strip()
+    if not question:
+        raise ValueError("A question is required")
+    if openai_client is None:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    if pinecone_client and PINECONE_INDEX:
+        query_embedding = _get_embedding(question)
+        index = pinecone_client.Index(PINECONE_INDEX)
+        response = index.query(vector=query_embedding, top_k=4, include_metadata=True)
+        context_chunks = [match["metadata"]["text"] for match in response.get("matches", []) if match.get("metadata")]
+    else:
+        index, metadata = _load_index_state()
+        if index is None or not metadata:
+            raise ValueError("No documents have been indexed yet")
+        query_embedding = _get_embedding(question)
+        query_vector = np.array([query_embedding], dtype="float32")
+        _, indices = index.search(query_vector, min(4, len(metadata)))
+        context_chunks = [metadata[int(i)]["text"] for i in indices[0] if int(i) < len(metadata)]
+
+    context = "\n\n".join(context_chunks)
+
+    response = openai_client.responses.create(
+        model=CHAT_MODEL,
+        input=[
+            {"role": "system", "content": "You answer questions using the provided document context. If the information is not present, say you do not know."},
+            {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
+        ],
+    )
+    answer = response.output_text
+    return {"answer": answer, "context": context_chunks}
+
+
 @app.post("/rag/query")
 async def query_documents(payload: dict[str, Any]) -> JSONResponse:
     try:
         question = str(payload.get("question", "")).strip()
         if not question:
             raise ValueError("A question is required")
-        if openai_client is None:
-            raise RuntimeError("OPENAI_API_KEY is not set")
-
-        if pinecone_client and PINECONE_INDEX:
-            query_embedding = _get_embedding(question)
-            index = pinecone_client.Index(PINECONE_INDEX)
-            response = index.query(vector=query_embedding, top_k=4, include_metadata=True)
-            context_chunks = [match["metadata"]["text"] for match in response.get("matches", []) if match.get("metadata")]
-        else:
-            index, metadata = _load_index_state()
-            if index is None or not metadata:
-                raise ValueError("No documents have been indexed yet")
-            query_embedding = _get_embedding(question)
-            query_vector = np.array([query_embedding], dtype="float32")
-            _, indices = index.search(query_vector, min(4, len(metadata)))
-            context_chunks = [metadata[int(i)]["text"] for i in indices[0] if int(i) < len(metadata)]
-
-        context = "\n\n".join(context_chunks)
-
-        response = openai_client.responses.create(
-            model=CHAT_MODEL,
-            input=[
-                {"role": "system", "content": "You answer questions using the provided document context. If the information is not present, say you do not know."},
-                {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
-            ],
-        )
-        answer = response.output_text
-        return JSONResponse(status_code=200, content={"answer": answer, "context": context_chunks})
+        result = answer_question_with_rag(question)
+        return JSONResponse(status_code=200, content={"answer": result["answer"], "context": result["context"]})
     except Exception as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -331,18 +395,50 @@ async def stream_transcription(websocket: WebSocket) -> None:
     shutdown_event = asyncio.Event()
     transcript_queue: "asyncio.Queue[str]" = asyncio.Queue()
     connection: Any = None
+    recording_active = False
+    transcript_buffer = ""
+    session_lock = asyncio.Lock()
+    last_transcript_seen = ""
 
     async def relay_audio() -> None:
+        nonlocal recording_active, transcript_buffer, last_transcript_seen
         try:
             while not shutdown_event.is_set():
                 message = await websocket.receive()
                 if message.get("type") == "websocket.disconnect":
                     break
                 if message.get("bytes"):
-                    if connection is not None:
+                    if connection is not None and recording_active:
                         audio_bytes = message["bytes"]
-                        print(f"[ws][audio] received {len(audio_bytes)} bytes")
                         await connection.send_media(audio_bytes)
+                elif message.get("text"):
+                    try:
+                        payload = json.loads(message["text"])
+                    except json.JSONDecodeError:
+                        continue
+                    event = str(payload.get("event", "")).strip()
+                    if event == "start_recording":
+                        async with session_lock:
+                            transcript_buffer = ""
+                            last_transcript_seen = ""
+                            recording_active = True
+                        await websocket.send_json({"event": "recording_started"})
+                    elif event == "stop_recording":
+                        async with session_lock:
+                            recording_active = False
+                        await websocket.send_json({"event": "recording_stopped"})
+                    elif event == "process_transcript":
+                        transcript_to_process = str(payload.get("transcript", "") or "").strip()
+                        async with session_lock:
+                            if transcript_to_process:
+                                transcript_buffer = transcript_to_process
+                            else:
+                                transcript_to_process = transcript_buffer.strip()
+                            recording_active = False
+                        if transcript_to_process:
+                            await process_transcript(transcript_to_process)
+                        else:
+                            await websocket.send_json({"event": "empty_transcript"})
         except WebSocketDisconnect:
             print("[ws] client disconnected")
         except asyncio.CancelledError:
@@ -357,11 +453,17 @@ async def stream_transcription(websocket: WebSocket) -> None:
         await consume_transcript_messages(connection, transcript_queue)
 
     async def emit_transcripts() -> None:
+        nonlocal transcript_buffer, last_transcript_seen
         while not shutdown_event.is_set():
             try:
                 transcript = await asyncio.wait_for(transcript_queue.get(), timeout=0.5)
                 if transcript:
-                    await websocket.send_text(transcript)
+                    async with session_lock:
+                        if transcript != last_transcript_seen:
+                            if recording_active:
+                                transcript_buffer = f"{transcript_buffer} {transcript}".strip()
+                            last_transcript_seen = transcript
+                    await websocket.send_json({"event": "transcript", "text": transcript})
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -371,6 +473,19 @@ async def stream_transcription(websocket: WebSocket) -> None:
             except Exception as exc:  # pragma: no cover - runtime logging path
                 print(f"[deepgram][stream-error] {exc}")
                 break
+
+    async def process_transcript(transcript_text: str) -> None:
+        try:
+            questions = extract_questions_from_transcript(transcript_text)
+            if not questions:
+                await websocket.send_json({"event": "pending_questions", "questions": []})
+                return
+            await websocket.send_json({"event": "pending_questions", "questions": questions})
+            for question in questions:
+                result = answer_question_with_rag(question)
+                await websocket.send_json({"question": question, "answer": result.get("answer", "")})
+        except Exception as exc:  # pragma: no cover - runtime logging path
+            await websocket.send_json({"event": "processing_error", "error": str(exc)})
 
     try:
         await websocket.send_text("Connected to streaming endpoint. Audio is being accepted.")

@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import consume_transcript_messages, extract_transcript_text, ingest_document, _chunk_text
+from types import SimpleNamespace
+
+from main import consume_transcript_messages, extract_questions_from_transcript, extract_transcript_text, ingest_document, _chunk_text
 
 
 class RAGTests(unittest.TestCase):
@@ -20,6 +22,28 @@ class RAGTests(unittest.TestCase):
             self.assertEqual(result["chunks_added"], 1)
             self.assertTrue((Path(temp_dir) / "faiss.index").exists())
             self.assertTrue((Path(temp_dir) / "metadata.json").exists())
+
+
+class TranscriptWorkflowTests(unittest.TestCase):
+    def test_extract_questions_from_transcript_returns_json_array(self) -> None:
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(
+                create=lambda **_: SimpleNamespace(output_text='["What is the revenue trend?", "What changed in margins?"]')
+            )
+        )
+
+        with patch("main.openai_client", fake_client):
+            questions = extract_questions_from_transcript("Hello there. What is the revenue trend? Also, what changed in margins?")
+
+        self.assertEqual(questions, ["What is the revenue trend?", "What changed in margins?"])
+
+    def test_extract_questions_from_transcript_finds_all_question_segments(self) -> None:
+        with patch("main.openai_client", None):
+            questions = extract_questions_from_transcript("Hello there. What is the revenue trend? Also, what changed in margins? Thanks for the update.")
+
+        self.assertEqual(len(questions), 2)
+        self.assertIn("What is the revenue trend?", questions)
+        self.assertIn("what changed in margins?", questions)
 
 
 class ConsumeTranscriptMessagesTests(unittest.IsolatedAsyncioTestCase):

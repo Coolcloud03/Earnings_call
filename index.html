@@ -240,6 +240,33 @@
         color: var(--muted);
       }
 
+      .recording {
+        background: linear-gradient(135deg, #ef4444, #f97316) !important;
+        box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2);
+      }
+
+      .question-list,
+      .answers-list {
+        display: grid;
+        gap: 10px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .question-item,
+      .answer-item {
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
+      }
+
+      .answer-item {
+        background: rgba(34, 197, 94, 0.12);
+        border-color: rgba(34, 197, 94, 0.22);
+      }
+
       @media (max-width: 850px) {
         .body { grid-template-columns: 1fr; }
         .hero { flex-direction: column; align-items: flex-start; }
@@ -262,14 +289,14 @@
       <section class="body">
         <div class="card">
           <div class="controls">
-            <button id="startButton" class="primary">🎙️ Start Session</button>
-            <button id="stopButton" class="secondary" disabled>⏹ Stop Session</button>
+            <button id="recordButton" class="primary" type="button">🎙️ Hold to Record</button>
+            <button id="sendButton" class="secondary" type="button">🚀 Send to AI</button>
           </div>
 
           <div class="info-panel">
             <div class="info-box">
-              <h3>Session state</h3>
-              <p id="sessionMessage">Press Start Session to request microphone access and begin streaming.</p>
+              <h3>PTT workflow</h3>
+              <p id="sessionMessage">Hold the button or press the Spacebar to capture audio. Release to stop, then press Send to AI to extract questions and answer them.</p>
             </div>
             <div class="info-box">
               <h3>Connection details</h3>
@@ -295,6 +322,20 @@
               </div>
               <div id="ragResult" class="rag-result">Your answer will appear here.</div>
             </div>
+
+            <div class="info-box">
+              <h3>Pending questions</h3>
+              <ul id="pendingQuestionsList" class="question-list">
+                <li class="placeholder">Questions will appear here after processing.</li>
+              </ul>
+            </div>
+
+            <div class="info-box">
+              <h3>Generated answers</h3>
+              <div id="answersPanel" class="answers-list">
+                <div class="placeholder">Answers appear here as each question is answered.</div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -313,14 +354,16 @@
     <script>
       const socketUrl = 'ws://127.0.0.1:8000/ws/stream';
       const apiBase = (window.location.origin && window.location.origin !== 'null') ? window.location.origin : 'http://127.0.0.1:8000';
-      const startButton = document.getElementById('startButton');
-      const stopButton = document.getElementById('stopButton');
+      const recordButton = document.getElementById('recordButton');
+      const sendButton = document.getElementById('sendButton');
       const connectionIndicator = document.getElementById('connectionIndicator');
       const connectionText = document.getElementById('connectionText');
       const sessionMessage = document.getElementById('sessionMessage');
       const connectionMessage = document.getElementById('connectionMessage');
       const liveState = document.getElementById('liveState');
       const transcriptionPanel = document.getElementById('transcriptionPanel');
+      const pendingQuestionsList = document.getElementById('pendingQuestionsList');
+      const answersPanel = document.getElementById('answersPanel');
       const documentInput = document.getElementById('documentInput');
       const uploadButton = document.getElementById('uploadButton');
       const uploadMessage = document.getElementById('uploadMessage');
@@ -329,13 +372,13 @@
       const ragResult = document.getElementById('ragResult');
 
       let socket = null;
+      let mediaStream = null;
       let audioContext = null;
       let processor = null;
       let inputNode = null;
-      let stream = null;
-      let isStreaming = false;
+      let isRecording = false;
       let reconnectTimer = null;
-      let audioChunkCount = 0;
+      let transcriptBuffer = '';
 
       function setConnectionState(state, message) {
         connectionText.textContent = state;
@@ -355,6 +398,33 @@
         transcriptionPanel.innerHTML = '<div class="placeholder">Transcribed text will appear here in real-time...</div>';
       }
 
+      function renderPendingQuestions(questions) {
+        pendingQuestionsList.innerHTML = '';
+        if (!questions.length) {
+          pendingQuestionsList.innerHTML = '<li class="placeholder">Questions will appear here after processing.</li>';
+          return;
+        }
+        const fragment = document.createDocumentFragment();
+        questions.forEach((question) => {
+          const item = document.createElement('li');
+          item.className = 'question-item';
+          item.textContent = question;
+          fragment.appendChild(item);
+        });
+        pendingQuestionsList.appendChild(fragment);
+      }
+
+      function renderAnswer(question, answer) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'answer-item';
+        wrapper.innerHTML = `<strong>${question}</strong><div>${answer || 'No answer returned.'}</div>`;
+        answersPanel.appendChild(wrapper);
+      }
+
+      function resetAnswerPanel() {
+        answersPanel.innerHTML = '<div class="placeholder">Answers appear here as each question is answered.</div>';
+      }
+
       function convertTo16BitPcm(inputData, sampleRate) {
         const ratio = sampleRate / 16000;
         const targetLength = Math.max(1, Math.floor(inputData.length / ratio));
@@ -370,7 +440,7 @@
         return output;
       }
 
-      function stopAudioCapture() {
+      function stopAudioProcessing() {
         if (processor) {
           processor.disconnect();
           processor.onaudioprocess = null;
@@ -384,10 +454,21 @@
           audioContext.close().catch(() => {});
         }
         audioContext = null;
-        if (stream) {
-          stream.getTracks().forEach((track) => track.stop());
-          stream = null;
+      }
+
+      function stopAudioCapture() {
+        stopAudioProcessing();
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          mediaStream = null;
         }
+      }
+
+      function sendSocketMessage(payload) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        socket.send(JSON.stringify(payload));
       }
 
       function connectWebSocket() {
@@ -397,42 +478,67 @@
 
         setConnectionState('Connecting', 'Opening WebSocket connection...');
         sessionMessage.textContent = 'Connecting to the backend...';
-
         return new Promise((resolve, reject) => {
           socket = new WebSocket(socketUrl);
 
           socket.addEventListener('open', () => {
             clearTimeout(reconnectTimer);
-            setConnectionState('Connected', 'WebSocket connected. Waiting for audio capture to begin.');
-            sessionMessage.textContent = 'Connected. Recording is ready.';
+            setConnectionState('Connected', 'WebSocket connected. Waiting for microphone input.');
+            sessionMessage.textContent = 'Connected. Hold the button to start capturing audio.';
             liveState.textContent = 'Ready';
             resolve(socket);
           });
 
           socket.addEventListener('message', (event) => {
+            if (event.data instanceof Blob) {
+              return;
+            }
             const text = typeof event.data === 'string' ? event.data : '[binary message]';
-            if (text) {
+            if (!text) {
+              return;
+            }
+            try {
+              const payload = JSON.parse(text);
+              if (payload?.event === 'transcript') {
+                appendTranscript(payload.text || '');
+                if (payload.text) {
+                  transcriptBuffer = `${transcriptBuffer} ${payload.text}`.trim();
+                }
+              } else if (payload?.event === 'pending_questions') {
+                renderPendingQuestions(Array.isArray(payload.questions) ? payload.questions : []);
+              } else if (payload?.question) {
+                renderAnswer(payload.question, payload.answer || '');
+              } else if (payload?.event === 'recording_started') {
+                setConnectionState('Live Listening', 'Recording started.');
+                sessionMessage.textContent = 'Recording... release to stop.';
+                liveState.textContent = 'Recording';
+              } else if (payload?.event === 'recording_stopped') {
+                setConnectionState('Connected', 'Recording stopped. Press Send to AI to process the transcript.');
+                sessionMessage.textContent = 'Recording stopped. Press Send to AI to process the transcript.';
+                liveState.textContent = 'Stopped';
+              } else if (payload?.event === 'empty_transcript') {
+                sessionMessage.textContent = 'No transcript was captured yet.';
+              } else if (payload?.event === 'processing_error') {
+                sessionMessage.textContent = payload.error || 'Processing failed.';
+              } else {
+                appendTranscript(text);
+              }
+            } catch (error) {
               appendTranscript(text);
             }
           });
 
           socket.addEventListener('close', () => {
-            if (!isStreaming) {
-              setConnectionState('Offline', 'WebSocket disconnected.');
-              sessionMessage.textContent = 'Connection closed. Retrying automatically...';
-              liveState.textContent = 'Idle';
-              if (!reconnectTimer) {
-                reconnectTimer = setTimeout(() => {
-                  reconnectTimer = null;
-                  connectWebSocket().catch(() => {});
-                }, 1200);
-              }
-            } else {
-              setConnectionState('Offline', 'WebSocket disconnected during streaming.');
-              sessionMessage.textContent = 'Connection lost during streaming.';
-              liveState.textContent = 'Idle';
+            setConnectionState('Offline', 'WebSocket disconnected.');
+            sessionMessage.textContent = 'Connection closed. Reconnecting...';
+            liveState.textContent = 'Idle';
+            if (!reconnectTimer) {
+              reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connectWebSocket().catch(() => {});
+              }, 1200);
             }
-            stopStreaming();
+            stopAudioCapture();
           });
 
           socket.addEventListener('error', () => {
@@ -444,44 +550,46 @@
         });
       }
 
-      async function startStreaming() {
-        if (isStreaming) return;
+      async function ensureMicrophoneAccess() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Microphone access is not supported in this browser.');
+        }
+        if (!mediaStream) {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+      }
+
+      async function beginRecording() {
+        if (isRecording) return;
 
         try {
-          if (!navigator.mediaDevices?.getUserMedia) {
-            throw new Error('Microphone access is not supported in this browser.');
-          }
-
           await connectWebSocket();
-          const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          stream = permissionStream;
+          await ensureMicrophoneAccess();
 
+          stopAudioProcessing();
           audioContext = new AudioContext();
           await audioContext.resume();
 
-          inputNode = audioContext.createMediaStreamSource(stream);
+          inputNode = audioContext.createMediaStreamSource(mediaStream);
           processor = audioContext.createScriptProcessor(4096, 1, 1);
           processor.onaudioprocess = (event) => {
             const inputData = event.inputBuffer.getChannelData(0);
-            const pcmData = convertTo16BitPcm(inputData, audioContext.sampleRate);
+            const sourceRate = event.inputBuffer.sampleRate || audioContext.sampleRate;
+            const pcmData = convertTo16BitPcm(inputData, sourceRate);
             if (socket?.readyState === WebSocket.OPEN) {
-              audioChunkCount += 1;
               socket.send(new Uint8Array(pcmData.buffer));
-              if (audioChunkCount % 20 === 0) {
-                console.log(`[audio] sent ${audioChunkCount} chunks (${pcmData.length} samples)`);
-              }
             }
           };
 
           inputNode.connect(processor);
           processor.connect(audioContext.destination);
 
-          isStreaming = true;
-          startButton.disabled = true;
-          stopButton.disabled = false;
-          setConnectionState('Live Listening', 'Connected to websocket. Audio streaming is active.');
-          sessionMessage.textContent = 'Microphone access granted. Streaming audio in real time.';
-          liveState.textContent = 'Listening';
+          isRecording = true;
+          recordButton.classList.add('recording');
+          recordButton.textContent = '🔴 Recording...';
+          sendSocketMessage({ event: 'start_recording' });
+          sessionMessage.textContent = 'Recording... release to stop.';
+          liveState.textContent = 'Recording';
         } catch (error) {
           console.error(error);
           stopAudioCapture();
@@ -490,14 +598,31 @@
         }
       }
 
-      function stopStreaming() {
-        stopAudioCapture();
-        isStreaming = false;
-        startButton.disabled = false;
-        stopButton.disabled = true;
-        if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
-          socket.close();
+      function stopRecording() {
+        if (!isRecording) return;
+
+        isRecording = false;
+        recordButton.classList.remove('recording');
+        recordButton.textContent = '🎙️ Hold to Record';
+        stopAudioProcessing();
+        sendSocketMessage({ event: 'stop_recording' });
+        sessionMessage.textContent = 'Recording stopped. Press Send to AI to process the transcript.';
+        liveState.textContent = 'Stopped';
+      }
+
+      async function sendTranscriptToAi() {
+        const currentTranscript = transcriptBuffer.trim();
+        if (!currentTranscript) {
+          sessionMessage.textContent = 'No transcript is available yet.';
+          return;
         }
+
+        sendButton.disabled = true;
+        sessionMessage.textContent = 'Sending transcript to the AI pipeline...';
+        sendSocketMessage({ event: 'process_transcript', transcript: currentTranscript });
+        setTimeout(() => {
+          sendButton.disabled = false;
+        }, 1200);
       }
 
       async function uploadDocument() {
@@ -550,8 +675,10 @@
         }
       }
 
-      startButton.addEventListener('click', startStreaming);
-      stopButton.addEventListener('click', stopStreaming);
+      recordButton.addEventListener('mousedown', beginRecording);
+      recordButton.addEventListener('mouseup', stopRecording);
+      recordButton.addEventListener('mouseleave', stopRecording);
+      sendButton.addEventListener('click', sendTranscriptToAi);
       uploadButton.addEventListener('click', uploadDocument);
       askButton.addEventListener('click', askDocumentQuestion);
       questionInput.addEventListener('keydown', (event) => {
@@ -560,11 +687,30 @@
         }
       });
 
+      window.addEventListener('mouseup', stopRecording);
+      window.addEventListener('keydown', (event) => {
+        if (event.code === 'Space' && !isRecording) {
+          event.preventDefault();
+          beginRecording();
+        }
+      });
+      window.addEventListener('keyup', (event) => {
+        if (event.code === 'Space' && isRecording) {
+          event.preventDefault();
+          stopRecording();
+        }
+      });
+
       window.addEventListener('beforeunload', () => {
-        stopStreaming();
+        stopAudioCapture();
+        if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
       });
 
       resetTranscriptPanel();
+      resetAnswerPanel();
+      connectWebSocket().catch(() => {});
     </script>
   </body>
 </html>
