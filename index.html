@@ -305,6 +305,11 @@
 
           <div class="rag-panel">
             <div class="info-box">
+                <h3>Database Management</h3>
+                <button id="clearDbButton" class="secondary" style="background-color: var(--danger);">🗑️ Clear Pinecone Index</button>
+                <p id="clearMessage" class="small">Warning: This will delete all indexed documents from Pinecone.</p>
+             </div>
+            <div class="info-box">
               <h3>Upload documents</h3>
               <input id="documentInput" type="file" accept=".txt,.pdf" />
               <div class="controls" style="margin-top: 12px;">
@@ -351,7 +356,9 @@
     </main>
 
     <script>
-      const socketUrl = 'ws://127.0.0.1:8000/ws/stream';
+    // Automatically use wss:// (secure websocket) if hosted on https://
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socketUrl = `${protocol}//${window.location.host}/ws/stream`;
       const apiBase = (window.location.origin && window.location.origin !== 'null') ? window.location.origin : 'http://127.0.0.1:8000';
       const recordButton = document.getElementById('recordButton');
       const connectionIndicator = document.getElementById('connectionIndicator');
@@ -736,9 +743,40 @@
         }
       });
 
+
       resetTranscriptPanel();
       resetAnswerPanel();
       connectWebSocket().catch(() => {});
+      async function clearDatabase() {
+        if (!confirm("Are you sure you want to delete all data from Pinecone? This cannot be undone.")) {
+            return;
+        }
+
+            const clearButton = document.getElementById('clearDbButton');
+            const clearMessage = document.getElementById('clearMessage');
+            
+            clearButton.disabled = true;
+            clearMessage.textContent = "Clearing database...";
+
+            try {
+                const response = await fetch(`${apiBase}/rag/clear`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (response.ok) {
+                    clearMessage.innerHTML = `<span style="color: var(--accent);">✅ ${data.message}</span>`;
+                } else {
+                    throw new Error(data.error || "Failed to clear database");
+                }
+            } catch (error) {
+                clearMessage.innerHTML = `<span style="color: var(--danger);">❌ ${error.message}</span>`;
+            } finally {
+                clearButton.disabled = false;
+            }
+        }
+        // Attach the event listener
+        document.getElementById('clearDbButton').addEventListener('click', clearDatabase);
     </script>
   </body>
 </html>
