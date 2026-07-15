@@ -141,7 +141,7 @@ requests==2.34.2
 requests-toolbelt==1.0.0
 rich==15.0.0
 safetensors==0.8.0
-scipy==1.18.0
+scipy==1.17.1
 setuptools==83.0.0
 shellingham==1.5.4
 simsimd==6.5.16
