@@ -289,14 +289,13 @@
       <section class="body">
         <div class="card">
           <div class="controls">
-            <button id="recordButton" class="primary" type="button">🎙️ Hold to Record</button>
-            <button id="sendButton" class="secondary" type="button">🚀 Send to AI</button>
+            <button id="recordButton" class="primary" type="button">🎙️ Start Recording</button>
           </div>
 
           <div class="info-panel">
             <div class="info-box">
-              <h3>PTT workflow</h3>
-              <p id="sessionMessage">Hold the button or press the Spacebar to capture audio. Release to stop, then press Send to AI to extract questions and answer them.</p>
+              <h3>Live QA Workflow</h3>
+              <p id="sessionMessage">Click the button or press Spacebar to start capturing audio. Click again to stop. The AI will automatically process the questions once you stop.</p>
             </div>
             <div class="info-box">
               <h3>Connection details</h3>
@@ -355,7 +354,6 @@
       const socketUrl = 'ws://127.0.0.1:8000/ws/stream';
       const apiBase = (window.location.origin && window.location.origin !== 'null') ? window.location.origin : 'http://127.0.0.1:8000';
       const recordButton = document.getElementById('recordButton');
-      const sendButton = document.getElementById('sendButton');
       const connectionIndicator = document.getElementById('connectionIndicator');
       const connectionText = document.getElementById('connectionText');
       const sessionMessage = document.getElementById('sessionMessage');
@@ -484,7 +482,7 @@
           socket.addEventListener('open', () => {
             clearTimeout(reconnectTimer);
             setConnectionState('Connected', 'WebSocket connected. Waiting for microphone input.');
-            sessionMessage.textContent = 'Connected. Hold the button to start capturing audio.';
+            sessionMessage.textContent = 'Connected. Click the button or tap Spacebar to start recording.';
             liveState.textContent = 'Ready';
             resolve(socket);
           });
@@ -510,16 +508,18 @@
                 renderAnswer(payload.question, payload.answer || '');
               } else if (payload?.event === 'recording_started') {
                 setConnectionState('Live Listening', 'Recording started.');
-                sessionMessage.textContent = 'Recording... release to stop.';
+                sessionMessage.textContent = 'Recording... Click again to stop and auto-process.';
                 liveState.textContent = 'Recording';
               } else if (payload?.event === 'recording_stopped') {
-                setConnectionState('Connected', 'Recording stopped. Press Send to AI to process the transcript.');
-                sessionMessage.textContent = 'Recording stopped. Press Send to AI to process the transcript.';
-                liveState.textContent = 'Stopped';
+                setConnectionState('Connected', 'Recording stopped. Processing transcript...');
+                sessionMessage.textContent = 'Extracting questions and generating answers...';
+                liveState.textContent = 'Processing';
               } else if (payload?.event === 'empty_transcript') {
-                sessionMessage.textContent = 'No transcript was captured yet.';
+                sessionMessage.textContent = 'No transcript was captured. Try recording again.';
+                liveState.textContent = 'Idle';
               } else if (payload?.event === 'processing_error') {
                 sessionMessage.textContent = payload.error || 'Processing failed.';
+                liveState.textContent = 'Error';
               } else {
                 appendTranscript(text);
               }
@@ -561,6 +561,12 @@
 
       async function beginRecording() {
         if (isRecording) return;
+        
+        // Clear previous state for a fresh session
+        transcriptBuffer = '';
+        resetTranscriptPanel();
+        resetAnswerPanel();
+        pendingQuestionsList.innerHTML = '<li class="placeholder">Questions will appear here after processing.</li>';
 
         try {
           await connectWebSocket();
@@ -586,10 +592,8 @@
 
           isRecording = true;
           recordButton.classList.add('recording');
-          recordButton.textContent = '🔴 Recording...';
+          recordButton.textContent = '🛑 Stop & Process';
           sendSocketMessage({ event: 'start_recording' });
-          sessionMessage.textContent = 'Recording... release to stop.';
-          liveState.textContent = 'Recording';
         } catch (error) {
           console.error(error);
           stopAudioCapture();
@@ -603,25 +607,41 @@
 
         isRecording = false;
         recordButton.classList.remove('recording');
-        recordButton.textContent = '🎙️ Hold to Record';
+        recordButton.textContent = '🎙️ Start Recording';
         stopAudioProcessing();
+        
+        // Tell backend to stop taking audio bytes
         sendSocketMessage({ event: 'stop_recording' });
-        sessionMessage.textContent = 'Recording stopped. Press Send to AI to process the transcript.';
-        liveState.textContent = 'Stopped';
+        
+        // Wait briefly for the final transcript chunks to arrive from Deepgram
+        setTimeout(() => {
+          sendTranscriptToAi();
+        }, 800);
+      }
+      
+      // Centralized toggle function for button clicks and spacebar
+      async function toggleRecording() {
+        if (isRecording) {
+            stopRecording();
+        } else {
+            await beginRecording();
+        }
       }
 
       async function sendTranscriptToAi() {
         const currentTranscript = transcriptBuffer.trim();
         if (!currentTranscript) {
-          sessionMessage.textContent = 'No transcript is available yet.';
+          sessionMessage.textContent = 'No transcript is available. Please record some audio first.';
+          liveState.textContent = 'Idle';
           return;
         }
 
-        sendButton.disabled = true;
-        sessionMessage.textContent = 'Sending transcript to the AI pipeline...';
+        recordButton.disabled = true; // Prevent rapid re-recordings while processing
         sendSocketMessage({ event: 'process_transcript', transcript: currentTranscript });
+        
+        // Re-enable the record button quickly so they can gear up for the next question
         setTimeout(() => {
-          sendButton.disabled = false;
+          recordButton.disabled = false;
         }, 1200);
       }
 
@@ -635,6 +655,7 @@
         const formData = new FormData();
         formData.append('file', file);
         uploadMessage.textContent = 'Uploading and indexing document...';
+        uploadButton.disabled = true;
 
         try {
           const response = await fetch(`${apiBase}/rag/upload`, {
@@ -648,6 +669,8 @@
           uploadMessage.textContent = `Indexed ${data.file_name} with ${data.chunks_added} chunk(s).`;
         } catch (error) {
           uploadMessage.textContent = error.message || 'Upload failed.';
+        } finally {
+          uploadButton.disabled = false;
         }
       }
 
@@ -659,6 +682,8 @@
         }
 
         ragResult.textContent = 'Thinking...';
+        askButton.disabled = true;
+        
         try {
           const response = await fetch(`${apiBase}/rag/query`, {
             method: 'POST',
@@ -672,13 +697,14 @@
           ragResult.textContent = data.answer || 'No answer returned.';
         } catch (error) {
           ragResult.textContent = error.message || 'Query failed.';
+        } finally {
+          askButton.disabled = false;
         }
       }
 
-      recordButton.addEventListener('mousedown', beginRecording);
-      recordButton.addEventListener('mouseup', stopRecording);
-      recordButton.addEventListener('mouseleave', stopRecording);
-      sendButton.addEventListener('click', sendTranscriptToAi);
+      // Replaced mousedown/up with a single click toggle
+      recordButton.addEventListener('click', toggleRecording);
+      
       uploadButton.addEventListener('click', uploadDocument);
       askButton.addEventListener('click', askDocumentQuestion);
       questionInput.addEventListener('keydown', (event) => {
@@ -687,17 +713,19 @@
         }
       });
 
-      window.addEventListener('mouseup', stopRecording);
+      // Prevent page scrolling on spacebar
       window.addEventListener('keydown', (event) => {
-        if (event.code === 'Space' && !isRecording) {
-          event.preventDefault();
-          beginRecording();
+        // Ensure we don't trigger if they are typing in an input field
+        if (event.code === 'Space' && event.target.tagName !== 'INPUT' && event.target.tagName !== 'TEXTAREA') {
+          event.preventDefault(); 
         }
       });
+      
+      // Trigger toggle on Spacebar UP
       window.addEventListener('keyup', (event) => {
-        if (event.code === 'Space' && isRecording) {
+        if (event.code === 'Space' && event.target.tagName !== 'INPUT' && event.target.tagName !== 'TEXTAREA') {
           event.preventDefault();
-          stopRecording();
+          toggleRecording();
         }
       });
 

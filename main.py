@@ -3,41 +3,35 @@ import io
 import json
 import os
 import re
+import shutil
 from pathlib import Path
-from typing import Any
-
-import faiss
-import numpy as np
-from dotenv import load_dotenv
-from openai import OpenAI
-from pypdf import PdfReader
-from pinecone import Pinecone
-
-load_dotenv(Path(__file__).with_name(".env"))
-
-
-async def consume_transcript_messages(connection: Any, transcript_queue: "asyncio.Queue[str]") -> None:
-    try:
-        async for message in connection:
-            transcript = extract_transcript_text(message)
-            if transcript:
-                transcript_queue.put_nowait(transcript)
-    except asyncio.CancelledError:
-        pass
-    except Exception as exc:  # pragma: no cover - runtime logging path
-        print(f"[deepgram][transcript-error] {exc}")
+from typing import Any, List
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
+# --- LangChain & Unstructured Imports ---
+from langchain_core.documents import Document
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_core.messages import HumanMessage
+from unstructured.partition.pdf import partition_pdf
+from unstructured.chunking.title import chunk_by_title
+from openai import OpenAI
+from pinecone import Pinecone
+
 try:
     from deepgram import AsyncDeepgramClient
-except ImportError:  # pragma: no cover - handled gracefully at runtime
+except ImportError:
     AsyncDeepgramClient = None
 
-app = FastAPI(title="Earnings Call AI Backend")
+# Load Environment Variables
+load_dotenv(Path(__file__).with_name(".env"))
+
+app = FastAPI(title="Earnings Call AI Backend - Multi-Modal Edition")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,242 +40,296 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Configuration & State ---
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-DOCS_DIR = DATA_DIR / "documents"
-DOCS_DIR.mkdir(exist_ok=True)
-INDEX_PATH = DATA_DIR / "faiss.index"
-METADATA_PATH = DATA_DIR / "metadata.json"
+TEMP_DIR = DATA_DIR / "temp"
+TEMP_DIR.mkdir(exist_ok=True)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o"
-PINECONE_INDEX = os.getenv("PINECONE_INDEX", "").strip()
-PINECONE_ENV = (os.getenv("PINECONE_ENVIRONMENT") or os.getenv("PINECONE_ENV") or "").strip()
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "").strip()
+ROUTER_MODEL = "gpt-4o-mini"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if OPENAI_API_KEY:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
 else:
     openai_client = None
+    embeddings = None
 
-pinecone_client = None
-if PINECONE_API_KEY and PINECONE_ENV and PINECONE_INDEX:
-    pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+# Initialize Global Vector Store if Index is provided
+vector_store = None
+if PINECONE_INDEX_NAME and embeddings:
+    vector_store = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
 
 
-def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return []
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = max(0, end - overlap)
+# ==========================================
+# PART 1: MULTI-MODAL RAG INGESTION PIPELINE
+# ==========================================
+
+def partition_document(file_path: str):
+    """Extract elements from PDF using unstructured (hi_res)"""
+    print(f"📄 Partitioning document: {file_path}")
+    elements = partition_pdf(
+        filename=file_path,
+        strategy="hi_res",
+        infer_table_structure=True,
+        extract_image_block_types=["Image"],
+        extract_image_block_to_payload=True
+    )
+    print(f"✅ Extracted {len(elements)} elements")
+    return elements
+
+def create_chunks_by_title(elements):
+    """Create intelligent chunks using title-based strategy"""
+    print("🔨 Creating smart chunks...")
+    chunks = chunk_by_title(
+        elements,
+        max_characters=3000,
+        new_after_n_chars=2400,
+        combine_text_under_n_chars=500
+    )
+    print(f"✅ Created {len(chunks)} chunks")
     return chunks
 
+def separate_content_types(chunk):
+    """Analyze what types of content are in a chunk"""
+    content_data = {
+        'text': chunk.text,
+        'tables': [],
+        'images': [],
+        'types': ['text']
+    }
+    if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
+        for element in chunk.metadata.orig_elements:
+            element_type = type(element).__name__
+            if element_type == 'Table':
+                content_data['types'].append('table')
+                table_html = getattr(element.metadata, 'text_as_html', element.text)
+                content_data['tables'].append(table_html)
+            elif element_type == 'Image':
+                if hasattr(element, 'metadata') and hasattr(element.metadata, 'image_base64'):
+                    content_data['types'].append('image')
+                    content_data['images'].append(element.metadata.image_base64)
+    content_data['types'] = list(set(content_data['types']))
+    return content_data
 
-def _extract_pdf_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(page for page in pages if page).strip()
-
-
-def _get_embedding(text: str) -> list[float]:
-    if openai_client is None:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    response = openai_client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return response.data[0].embedding
-
-
-def _load_index_state() -> tuple[faiss.IndexFlatL2 | None, list[dict[str, Any]]]:
-    if not INDEX_PATH.exists() or not METADATA_PATH.exists():
-        return None, []
-    index = faiss.read_index(str(INDEX_PATH))
-    with METADATA_PATH.open("r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    return index, metadata
-
-
-def _save_index_state(index: faiss.IndexFlatL2, metadata: list[dict[str, Any]]) -> None:
-    faiss.write_index(index, str(INDEX_PATH))
-    with METADATA_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-
-
-def _upsert_to_pinecone(file_name: str, chunks: list[str], embeddings: list[list[float]]) -> None:
-    if not pinecone_client or not PINECONE_INDEX:
-        return
+def create_ai_enhanced_summary(text: str, tables: List[str], images: List[str]) -> str:
+    """Create AI-enhanced summary for mixed content"""
     try:
-        index = pinecone_client.Index(PINECONE_INDEX)
-        vectors = []
-        for chunk, embedding in zip(chunks, embeddings, strict=False):
-            vectors.append((f"{file_name}:{len(vectors)}", embedding, {"source": file_name, "text": chunk}))
-        if vectors:
-            index.upsert(vectors=vectors)
-    except Exception as exc:  # pragma: no cover - runtime logging path
-        print(f"[pinecone][upsert-error] {exc}")
+        llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
+        prompt_text = f"You are creating a searchable description for document content retrieval.\n\nTEXT CONTENT:\n{text}\n\n"
+        if tables:
+            prompt_text += "TABLES:\n"
+            for i, table in enumerate(tables):
+                prompt_text += f"Table {i+1}:\n{table}\n\n"
+        prompt_text += "Generate a comprehensive, searchable description covering key facts, main topics, and visual content analysis. SEARCHABLE DESCRIPTION:"
 
+        message_content = [{"type": "text", "text": prompt_text}]
+        for image_base64 in images:
+            message_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+            })
+        
+        message = HumanMessage(content=message_content)
+        response = llm.invoke([message])
+        return response.content
+    except Exception as e:
+        print(f"❌ AI summary failed: {e}")
+        return f"{text[:300]}..."
 
-def ingest_document(file_name: str, file_bytes: bytes) -> dict[str, Any]:
-    if file_name.lower().endswith(".pdf"):
-        text = _extract_pdf_text(file_bytes)
-    else:
-        text = file_bytes.decode("utf-8", errors="ignore")
+def summarise_chunks(chunks):
+    """Process all chunks with AI Summaries"""
+    print("🧠 Processing chunks with AI Summaries...")
+    langchain_documents = []
+    
+    for i, chunk in enumerate(chunks):
+        content_data = separate_content_types(chunk)
+        if content_data['tables'] or content_data['images']:
+            enhanced_content = create_ai_enhanced_summary(content_data['text'], content_data['tables'], content_data['images'])
+        else:
+            enhanced_content = content_data['text']
+            
+        doc = Document(
+            page_content=enhanced_content,
+            metadata={
+                "original_content": json.dumps({
+                    "raw_text": content_data['text'],
+                    "tables_html": content_data['tables'],
+                    "images_base64": content_data['images']
+                })
+            }
+        )
+        langchain_documents.append(doc)
+    return langchain_documents
 
-    chunks = _chunk_text(text)
-    if not chunks:
-        raise ValueError("No text could be extracted from the uploaded document")
+def run_complete_ingestion_pipeline(pdf_path: str):
+    """Run the complete multi-modal RAG ingestion pipeline"""
+    global vector_store
+    
+    print(f"🚀 Starting RAG Ingestion Pipeline for: {pdf_path}")
+    
+    # Extract, Chunk & Summarize
+    print("🔨 Extracting and chunking document...")
+    elements = partition_document(pdf_path)
+    chunks = create_chunks_by_title(elements)
+    
+    print("🧠 Processing chunks with AI Summaries...")
+    summarised_chunks = summarise_chunks(chunks)
+    
+    # Clean Metadata for Pinecone Limits
+    print("🧹 Cleaning chunk metadata...")
+    cleaned_chunks = []
+    for chunk in summarised_chunks: 
+        safe_metadata = {
+            "source": chunk.metadata.get("source", pdf_path),
+            "page_number": chunk.metadata.get("page_number", 1),
+            "summary": "AI Summary Applied" 
+        }
 
-    index, metadata = _load_index_state()
-    if index is None:
-        dimension = 1536
-        index = faiss.IndexFlatL2(dimension)
-    embeddings = []
-    for chunk in chunks:
-        embedding = _get_embedding(chunk)
-        embeddings.append(embedding)
+        if "original_content" in chunk.metadata:
+            try:
+                orig_data = json.loads(chunk.metadata["original_content"])
+                orig_data["images_base64"] = [] 
+                safe_metadata["original_content"] = json.dumps(orig_data)
+            except Exception:
+                pass
+        
+        cleaned_doc = Document(
+            page_content=chunk.page_content,
+            metadata=safe_metadata
+        )
+        cleaned_chunks.append(cleaned_doc)
 
-    vectors = np.array(embeddings, dtype="float32")
-    index.add(vectors)
-
-    for chunk in chunks:
-        metadata.append({"source": file_name, "text": chunk})
-
-    _save_index_state(index, metadata)
-    _upsert_to_pinecone(file_name, chunks, embeddings)
-    return {"file_name": file_name, "chunks_added": len(chunks)}
-
+    # Upload to Pinecone
+    try:
+        print(f"🔮 Storing {len(cleaned_chunks)} chunks in Pinecone...")
+        vector_store.add_documents(documents=cleaned_chunks) 
+        print("✅ Successfully stored in Pinecone!")
+        return len(cleaned_chunks)
+    except Exception as e:
+        print(f"\n❌ PINECONE ERROR REVEALED:\n{e}")
+        return 0
+    
 
 @app.post("/rag/upload")
 async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
     try:
-        contents = await file.read()
-        result = ingest_document(file.filename or "upload.txt", contents)
-        return JSONResponse(status_code=200, content=result)
+        temp_file_path = TEMP_DIR / (file.filename or "upload.pdf")
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        chunks_added = run_complete_ingestion_pipeline(str(temp_file_path))
+        os.remove(temp_file_path)
+        
+        return JSONResponse(status_code=200, content={"file_name": file.filename, "chunks_added": chunks_added})
     except Exception as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-def extract_questions_from_transcript(transcript: str) -> list[str]:
-    cleaned = (transcript or "").strip()
-    if not cleaned:
-        return []
-
-    def normalize_question(raw: str) -> str:
-        question = re.sub(r"\s+", " ", raw or "").strip(" -•,;:")
-        if not question:
-            return ""
-        question = re.sub(r"^(?:also|and|so|well|uh|um|let me see|let's see|i mean|i guess|okay|right)\s*,?\s*", "", question, flags=re.IGNORECASE)
-        question = question.strip(" -•,;:")
-        if not question.endswith("?"):
-            question = f"{question}?"
-        return question.strip()
-
-    if openai_client is None:
-        fallback_questions = []
-        for segment in re.split(r"(?<=[?.!])\s+", cleaned):
-            if "?" not in segment:
-                continue
-            normalized = normalize_question(segment)
-            if normalized and normalized not in fallback_questions:
-                fallback_questions.append(normalized)
-        return fallback_questions
-
+@app.post("/rag/clear")
+async def clear_database() -> JSONResponse:
+    """Endpoint to delete all vectors from the Pinecone index."""
     try:
-        prompt = (
-            "You are an extraction filter. Analyze the full transcript, remove conversational filler, and return a strict JSON array of every distinct question asked by the caller. "
-            "Do not include greetings, small talk, or non-question statements. Return only valid JSON, e.g. [\"What is the revenue trend?\"]."
-        )
-        response = openai_client.responses.create(
-            model=CHAT_MODEL,
-            input=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": cleaned},
-            ],
-        )
-        answer_text = (response.output_text or "").strip()
-        if answer_text.startswith("[") and answer_text.endswith("]"):
-            parsed = json.loads(answer_text)
-            if isinstance(parsed, list):
-                questions = [normalize_question(str(item)) for item in parsed if str(item).strip()]
-                return [question for question in questions if question]
-    except Exception as exc:  # pragma: no cover - runtime logging path
-        print(f"[extract-questions][error] {exc}")
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key or not PINECONE_INDEX_NAME:
+            return JSONResponse(
+                status_code=400, 
+                content={"error": "Pinecone API Key or Index Name is missing in environment variables."}
+            )
 
-    fallback_questions = []
-    for segment in re.split(r"(?<=[?.!])\s+", cleaned):
-        if "?" not in segment:
-            continue
-        normalized = normalize_question(segment)
-        if normalized and normalized not in fallback_questions:
-            fallback_questions.append(normalized)
-    return fallback_questions
+        print(f"🗑️ Attempting to clear index: {PINECONE_INDEX_NAME}...")
+        pc = Pinecone(api_key=pinecone_api_key)
+        index = pc.Index(PINECONE_INDEX_NAME)
+        index.delete(delete_all=True, namespace="")
+        print("✅ Database cleared successfully!")
+        return JSONResponse(
+            status_code=200, 
+            content={"message": f"Successfully cleared all data from index: {PINECONE_INDEX_NAME}"}
+        )
+    except Exception as exc:
+        print(f"❌ Failed to clear database: {exc}")
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
+
+# ==========================================
+# PART 2: MULTI-MODAL GENERATION LOGIC
+# ==========================================
+
+def generate_final_answer(chunks, query: str) -> str:
+    """Generate final answer using multimodal content and Vision LLM"""
+    try:
+        llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
+        prompt_text = f"Based on the following documents, please answer this question: {query}\n\nCONTENT TO ANALYZE:\n"
+        
+        for i, chunk in enumerate(chunks):
+            prompt_text += f"--- Document {i+1} ---\n"
+            if "original_content" in chunk.metadata:
+                original_data = json.loads(chunk.metadata["original_content"])
+                raw_text = original_data.get("raw_text", "")
+                if raw_text:
+                    prompt_text += f"TEXT:\n{raw_text}\n\n"
+                
+                tables_html = original_data.get("tables_html", [])
+                if tables_html:
+                    prompt_text += "TABLES:\n"
+                    for j, table in enumerate(tables_html):
+                        prompt_text += f"Table {j+1}:\n{table}\n\n"
+            else:
+                prompt_text += f"TEXT:\n{chunk.page_content}\n\n"
+            prompt_text += "\n"
+        
+        prompt_text += "Please provide a clear, comprehensive answer using the text, tables, and images above. If the documents don't contain sufficient information, say you don't have enough information.\n\nANSWER:"
+
+        message_content = [{"type": "text", "text": prompt_text}]
+        for chunk in chunks:
+            if "original_content" in chunk.metadata:
+                original_data = json.loads(chunk.metadata["original_content"])
+                images_base64 = original_data.get("images_base64", [])
+                for image_base64 in images_base64:
+                    message_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                    })
+                    
+        message = HumanMessage(content=message_content)
+        response = llm.invoke([message])
+        return response.content
+    except Exception as e:
+        print(f"❌ Answer generation failed: {e}")
+        return "Sorry, I encountered an error while generating the answer."
+    
 
 def answer_question_with_rag(question: str) -> dict[str, Any]:
     question = (question or "").strip()
     if not question:
         raise ValueError("A question is required")
-    if openai_client is None:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+    if not vector_store:
+        raise ValueError("Vector store is not initialized. Upload a document first.")
 
-    if pinecone_client and PINECONE_INDEX:
-        query_embedding = _get_embedding(question)
-        index = pinecone_client.Index(PINECONE_INDEX)
-        response = index.query(vector=query_embedding, top_k=4, include_metadata=True)
-        context_chunks = [match["metadata"]["text"] for match in response.get("matches", []) if match.get("metadata")]
-    else:
-        index, metadata = _load_index_state()
-        if index is None or not metadata:
-            raise ValueError("No documents have been indexed yet")
-        query_embedding = _get_embedding(question)
-        query_vector = np.array([query_embedding], dtype="float32")
-        _, indices = index.search(query_vector, min(4, len(metadata)))
-        context_chunks = [metadata[int(i)]["text"] for i in indices[0] if int(i) < len(metadata)]
-
-    context = "\n\n".join(context_chunks)
-
-    response = openai_client.responses.create(
-        model=CHAT_MODEL,
-        input=[
-            {"role": "system", "content": "You answer questions using the provided document context. If the information is not present, say you do not know."},
-            {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
-        ],
-    )
-    answer = response.output_text
-    return {"answer": answer, "context": context_chunks}
-
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    retrieved_chunks = retriever.invoke(question)
+    
+    answer = generate_final_answer(retrieved_chunks, question)
+    context = [chunk.page_content for chunk in retrieved_chunks]
+    return {"answer": answer, "context": context}
 
 @app.post("/rag/query")
 async def query_documents(payload: dict[str, Any]) -> JSONResponse:
     try:
         question = str(payload.get("question", "")).strip()
-        if not question:
-            raise ValueError("A question is required")
         result = answer_question_with_rag(question)
         return JSONResponse(status_code=200, content={"answer": result["answer"], "context": result["context"]})
     except Exception as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-@app.get("/", include_in_schema=False)
-async def index():
-    html_path = Path(__file__).parent / "index.html"
-    return FileResponse(html_path)
-
-# @app.get("/", include_in_schema=False)
-# async def index() -> HTMLResponse:
-#     html_path = os.path.join(os.path.dirname(__file__), "index.html")
-#     with open(html_path, "r", encoding="utf-8") as handle:
-#         return HTMLResponse(handle.read())
-# above is the better way
+# ==========================================
+# PART 3: WEBSOCKET & AUDIO STREAMING
+# ==========================================
 
 def extract_transcript_text(payload: Any) -> str | None:
     if payload is None:
@@ -337,19 +385,82 @@ def extract_transcript_text(payload: Any) -> str | None:
                 text = pick_text(item)
                 if text:
                     return text
-
     return None
 
+async def consume_transcript_messages(connection: Any, transcript_queue: "asyncio.Queue[str]") -> None:
+    try:
+        async for message in connection:
+            transcript = extract_transcript_text(message)
+            if transcript:
+                transcript_queue.put_nowait(transcript)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # pragma: no cover - runtime logging path
+        print(f"[deepgram][transcript-error] {exc}")
+
+def extract_questions_from_transcript(transcript: str) -> list[str]:
+    cleaned = (transcript or "").strip()
+    if not cleaned:
+        return []
+
+    def normalize_question(raw: str) -> str:
+        question = re.sub(r"\s+", " ", raw or "").strip(" -•,;:")
+        if not question:
+            return ""
+        question = re.sub(r"^(?:also|and|so|well|uh|um|let me see|let's see|i mean|i guess|okay|right)\s*,?\s*", "", question, flags=re.IGNORECASE)
+        question = question.strip(" -•,;:")
+        if not question.endswith("?"):
+            question = f"{question}?"
+        return question.strip()
+
+    if openai_client is None:
+        fallback_questions = []
+        for segment in re.split(r"(?<=[?.!])\s+", cleaned):
+            if "?" not in segment:
+                continue
+            normalized = normalize_question(segment)
+            if normalized and normalized not in fallback_questions:
+                fallback_questions.append(normalized)
+        return fallback_questions
+
+    try:
+        prompt = (
+            "You are an extraction filter. Analyze the full transcript, remove conversational filler, and return a strict JSON array of every distinct question asked by the caller. "
+            "Do not include greetings, small talk, or non-question statements. Return only valid JSON, e.g. [\"What is the revenue trend?\"]."
+        )
+        response = openai_client.chat.completions.create(
+            model=ROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": cleaned},
+            ],
+            temperature=0
+        )
+        answer_text = (response.choices[0].message.content or "").strip()
+        if answer_text.startswith("[") and answer_text.endswith("]"):
+            parsed = json.loads(answer_text)
+            if isinstance(parsed, list):
+                questions = [normalize_question(str(item)) for item in parsed if str(item).strip()]
+                return [question for question in questions if question]
+    except Exception as exc:
+        print(f"[extract-questions][error] {exc}")
+
+    fallback_questions = []
+    for segment in re.split(r"(?<=[?.!])\s+", cleaned):
+        if "?" not in segment:
+            continue
+        normalized = normalize_question(segment)
+        if normalized and normalized not in fallback_questions:
+            fallback_questions.append(normalized)
+    return fallback_questions
 
 def load_api_key() -> str | None:
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if api_key:
         return api_key
-
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if not os.path.exists(env_path):
         return None
-
     try:
         with open(env_path, "r", encoding="utf-8") as handle:
             for raw_line in handle:
@@ -361,9 +472,7 @@ def load_api_key() -> str | None:
                     return value.strip().strip('"').strip("'") or None
     except OSError:
         return None
-
     return None
-
 
 @app.websocket("/ws/stream")
 async def stream_transcription(websocket: WebSocket) -> None:
@@ -443,7 +552,7 @@ async def stream_transcription(websocket: WebSocket) -> None:
             print("[ws] client disconnected")
         except asyncio.CancelledError:
             pass
-        except Exception as exc:  # pragma: no cover - runtime logging path
+        except Exception as exc: 
             print(f"[ws][audio-error] {exc}")
         finally:
             shutdown_event.set()
@@ -470,7 +579,7 @@ async def stream_transcription(websocket: WebSocket) -> None:
                 break
             except WebSocketDisconnect:
                 break
-            except Exception as exc:  # pragma: no cover - runtime logging path
+            except Exception as exc: 
                 print(f"[deepgram][stream-error] {exc}")
                 break
 
@@ -482,14 +591,17 @@ async def stream_transcription(websocket: WebSocket) -> None:
                 return
             await websocket.send_json({"event": "pending_questions", "questions": questions})
             for question in questions:
+                # Triggers the New Multi-Modal LangChain/Pinecone RAG Pipeline
                 result = answer_question_with_rag(question)
-                await websocket.send_json({"question": question, "answer": result.get("answer", "")})
-        except Exception as exc:  # pragma: no cover - runtime logging path
+                # Sends structured JSON back to the frontend
+                await websocket.send_json({"event": "answer", "question": question, "answer": result.get("answer", "")})
+        except Exception as exc:  
             await websocket.send_json({"event": "processing_error", "error": str(exc)})
 
     try:
-        await websocket.send_text("Connected to streaming endpoint. Audio is being accepted.")
+        await websocket.send_json({"event": "connected", "text": "Connected to streaming endpoint. Audio is being accepted."})
         deepgram_client = AsyncDeepgramClient(api_key=api_key)
+        
         async with deepgram_client.listen.v1.connect(
             model="nova-2",
             language="en-US",
@@ -502,26 +614,29 @@ async def stream_transcription(websocket: WebSocket) -> None:
             transcript_task = asyncio.create_task(consume_transcripts())
             emit_task = asyncio.create_task(emit_transcripts())
             await asyncio.gather(audio_task, transcript_task, emit_task, return_exceptions=True)
+            
     except WebSocketDisconnect:
         print("[ws] client disconnected")
-    except Exception as exc:  # pragma no cover - runtime logging path
+    except Exception as exc: 
         print(f"[ws][error] {exc}")
     finally:
         shutdown_event.set()
         if connection is not None:
             try:
                 await connection.send_close_stream()
-            except Exception:  # pragma: no cover - cleanup path
+            except Exception: 
                 pass
         try:
             await websocket.close()
-        except Exception:  # pragma: no cover - cleanup path
+        except Exception: 
             pass
+
+
+@app.get("/", include_in_schema=False)
+async def index():
+    html_path = Path(__file__).parent / "index.html"
+    return FileResponse(html_path)
 
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
-
-
-
-
